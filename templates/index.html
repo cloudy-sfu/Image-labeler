@@ -1,0 +1,334 @@
+{% extends "base.html" %}
+{% block title %}Projects – Image Labeler{% endblock %}
+{% block body %}
+<div class="page-index">
+  <header class="top-bar"><h1>🏷️ Image Labeler</h1></header>
+
+  <div class="index-content">
+    <!-- project list -->
+    <section class="project-list">
+      <h2>Projects</h2>
+      {% for pid, p in projects.items() %}
+      <div class="project-card">
+        <div class="project-info">
+          <a href="/project/{{ pid }}"><strong>{{ p.name }}</strong></a>
+          <span class="badge">{{ task_display.get(p.task, p.task) }}</span>
+          <span class="progress">{{ p._labeled }}/{{ p._total }} labeled</span>
+        </div>
+        <button class="btn-sm btn-danger" onclick="deleteProject('{{ pid }}')">Delete</button>
+      </div>
+      {% endfor %}
+      {% if not projects %}
+      <p class="muted">No projects yet. Create one below.</p>
+      {% endif %}
+    </section>
+
+    <!-- create form -->
+    <section class="create-section">
+      <h2>Create Project</h2>
+      <form id="createForm">
+        <label>Name <input name="name" required></label>
+
+        <label for="imageDirInput">Image directory</label>
+        <div class="folder-input-wrap">
+          <input name="image_dir" id="imageDirInput" required placeholder="/path/to/images">
+          <button type="button" class="btn-sm" onclick="openFolderPicker('imageDirInput')">Browse…</button>
+        </div>
+
+        <label for="annDirInput">Annotation directory</label>
+        <div class="folder-input-wrap">
+          <input name="annotation_dir" id="annDirInput" required placeholder="/path/to/annotations">
+          <button type="button" class="btn-sm" onclick="openFolderPicker('annDirInput')">Browse…</button>
+        </div>
+
+        <label>Task
+          <select name="task" id="taskSelect">
+            {% for key, display in task_display.items() %}
+            <option value="{{ key }}"{% if key == "detection" %} selected{% endif %}>{{ display }}</option>
+            {% endfor %}
+          </select>
+        </label>
+
+        <fieldset id="labelGroupsFieldset">
+          <legend>Label Groups (dimensions)</legend>
+          <p class="muted" style="font-size:12px;margin-bottom:8px;">
+            Each group defines an independent classification dimension.
+            Every annotation must have exactly one label per group.
+          </p>
+          <div id="labelGroupsContainer"></div>
+          <button type="button" class="btn-sm" onclick="addLabelGroup()">+ Add group</button>
+        </fieldset>
+
+        <fieldset id="skeletonFieldset" style="display:none">
+          <legend>Skeleton Configuration</legend>
+          <label>Keypoint names (one per line)
+            <textarea name="keypoint_names" rows="4" placeholder="nose&#10;left_eye&#10;right_eye"></textarea>
+          </label>
+          <label>Edges (pairs, e.g. 0-1,1-2,0-2)
+            <input name="skeleton_edges" placeholder="0-1,1-2">
+          </label>
+        </fieldset>
+
+        <button type="submit" class="btn-primary">Create</button>
+        <div id="createError" class="error"></div>
+      </form>
+    </section>
+  </div>
+</div>
+
+<!-- Folder picker modal -->
+<div class="modal-overlay" id="folderModal" style="display:none">
+  <div class="modal-dialog folder-picker">
+    <div class="modal-header">
+      <h3>Select Folder</h3>
+      <button class="btn-sm" onclick="closeFolderPicker()">✕</button>
+    </div>
+    <div class="folder-path-bar">
+      <button class="btn-sm" id="folderUpBtn" onclick="folderUp()">⬆ Parent</button>
+      <input id="folderPathDisplay" readonly>
+    </div>
+    <div class="folder-list" id="folderList"></div>
+    <div class="modal-footer">
+      <button class="btn-sm" onclick="closeFolderPicker()">Cancel</button>
+      <button class="btn-primary" onclick="confirmFolder()">Select this folder</button>
+    </div>
+  </div>
+</div>
+
+<!-- Label group editor modal -->
+<div class="modal-overlay" id="labelEditorModal" style="display:none">
+  <div class="modal-dialog label-editor-dialog">
+    <div class="modal-header">
+      <h3>Edit Labels</h3>
+      <button class="btn-sm" onclick="closeLabelEditor()">✕</button>
+    </div>
+    <div class="label-editor-body">
+      <p class="muted" style="font-size:12px;margin-bottom:8px;">
+        One label per row. Label name is required; description is optional.
+      </p>
+      <div id="labelEditorRows"></div>
+      <button type="button" class="btn-sm" onclick="addLabelRow()">+ Add label</button>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-sm" onclick="closeLabelEditor()">Cancel</button>
+      <button class="btn-primary" onclick="confirmLabelEditor()">OK</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Task select toggle skeleton ──
+document.getElementById('taskSelect').addEventListener('change', e => {
+  document.getElementById('skeletonFieldset').style.display =
+    e.target.value === 'skeleton' ? '' : 'none';
+});
+
+// ── Label Groups ──
+// Each group: { name: string, labels: [{name, description}] }
+let labelGroupsData = [{ name: "", labels: [] }];
+
+function renderLabelGroups() {
+  const c = document.getElementById('labelGroupsContainer');
+  c.innerHTML = '';
+  labelGroupsData.forEach((g, gi) => {
+    const div = document.createElement('div');
+    div.className = 'label-group-row';
+    const nameInput = document.createElement('input');
+    nameInput.placeholder = 'Group name';
+    nameInput.value = g.name;
+    nameInput.addEventListener('input', () => { g.name = nameInput.value; });
+
+    const summary = document.createElement('span');
+    summary.className = 'lg-summary';
+    summary.textContent = g.labels.length ? g.labels.map(l => l.name).join(', ') : '(no labels)';
+
+    const editBtn = document.createElement('button');
+    editBtn.type = 'button';
+    editBtn.className = 'btn-sm';
+    editBtn.textContent = '✏️ Edit labels';
+    editBtn.addEventListener('click', () => openLabelEditor(gi));
+
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.className = 'btn-sm btn-danger';
+    delBtn.textContent = '×';
+    delBtn.addEventListener('click', () => {
+      labelGroupsData.splice(gi, 1);
+      renderLabelGroups();
+    });
+
+    div.appendChild(nameInput);
+    div.appendChild(summary);
+    div.appendChild(editBtn);
+    div.appendChild(delBtn);
+    c.appendChild(div);
+  });
+}
+
+function addLabelGroup() {
+  labelGroupsData.push({ name: "", labels: [] });
+  renderLabelGroups();
+}
+renderLabelGroups();
+
+// ── Label editor modal ──
+let editingGroupIdx = -1;
+let editingLabels = [];
+
+function openLabelEditor(gi) {
+  editingGroupIdx = gi;
+  editingLabels = JSON.parse(JSON.stringify(labelGroupsData[gi].labels));
+  if (editingLabels.length === 0) editingLabels.push({ name: "", description: "" });
+  renderLabelEditorRows();
+  document.getElementById('labelEditorModal').style.display = '';
+}
+
+function closeLabelEditor() {
+  document.getElementById('labelEditorModal').style.display = 'none';
+}
+
+function renderLabelEditorRows() {
+  const c = document.getElementById('labelEditorRows');
+  c.innerHTML = '';
+  editingLabels.forEach((lbl, li) => {
+    const row = document.createElement('div');
+    row.className = 'label-editor-row';
+    row.innerHTML = `
+      <input class="le-name" placeholder="Label name" value="">
+      <input class="le-desc" placeholder="Description (optional)" value="">
+      <button type="button" class="btn-sm btn-danger le-del">×</button>
+    `;
+    // Set values via DOM to avoid HTML injection from label names
+    row.querySelector('.le-name').value = lbl.name;
+    row.querySelector('.le-desc').value = lbl.description || '';
+    row.querySelector('.le-name').addEventListener('input', e => { lbl.name = e.target.value; });
+    row.querySelector('.le-desc').addEventListener('input', e => { lbl.description = e.target.value; });
+    row.querySelector('.le-del').addEventListener('click', () => {
+      editingLabels.splice(li, 1);
+      renderLabelEditorRows();
+    });
+    c.appendChild(row);
+  });
+}
+
+function addLabelRow() {
+  editingLabels.push({ name: "", description: "" });
+  renderLabelEditorRows();
+  // Focus the last name input
+  const inputs = document.querySelectorAll('#labelEditorRows .le-name');
+  if (inputs.length) inputs[inputs.length - 1].focus();
+}
+
+function confirmLabelEditor() {
+  // Filter out empty-name labels
+  const valid = editingLabels.filter(l => l.name.trim() !== '');
+  valid.forEach(l => { l.name = l.name.trim(); l.description = (l.description || '').trim(); });
+  labelGroupsData[editingGroupIdx].labels = valid;
+  closeLabelEditor();
+  renderLabelGroups();
+}
+
+// ── Folder picker ──
+let folderPickerTarget = null;
+let folderCurrentPath = '';
+
+function openFolderPicker(inputId) {
+  folderPickerTarget = inputId;
+  // Start from current value in the input, or fall back to server-side home
+  const currentVal = document.getElementById(inputId).value.trim();
+  if (currentVal) {
+    loadFolder(currentVal);
+  } else {
+    // Request home directory from server
+    loadFolder('__HOME__');
+  }
+  document.getElementById('folderModal').style.display = '';
+}
+
+function closeFolderPicker() {
+  document.getElementById('folderModal').style.display = 'none';
+}
+
+async function loadFolder(path) {
+  const res = await fetch('/api/browse_folders?path=' + encodeURIComponent(path));
+  const data = await res.json();
+  if (data.error) {
+    // If the path is invalid, fall back to home
+    if (path !== '__HOME__') {
+      loadFolder('__HOME__');
+    }
+    return;
+  }
+  folderCurrentPath = data.path || '';
+  document.getElementById('folderPathDisplay').value = folderCurrentPath || '(root)';
+  document.getElementById('folderUpBtn').disabled = !data.parent;
+  const list = document.getElementById('folderList');
+  list.innerHTML = '';
+  data.dirs.forEach(d => {
+    const div = document.createElement('div');
+    div.className = 'folder-item';
+    div.textContent = '📁 ' + d;
+    div.addEventListener('dblclick', () => {
+      const sep = folderCurrentPath.endsWith('/') || folderCurrentPath.endsWith('\\') ? '' : '/';
+      const newPath = folderCurrentPath ? (folderCurrentPath + sep + d) : d;
+      loadFolder(newPath);
+    });
+    div.addEventListener('click', () => {
+      list.querySelectorAll('.folder-item').forEach(el => el.classList.remove('selected'));
+      div.classList.add('selected');
+    });
+    list.appendChild(div);
+  });
+}
+
+function folderUp() {
+  fetch('/api/browse_folders?path=' + encodeURIComponent(folderCurrentPath))
+    .then(r => r.json()).then(data => {
+      if (data.parent != null) loadFolder(data.parent);
+    });
+}
+
+function confirmFolder() {
+  if (folderPickerTarget && folderCurrentPath) {
+    const inp = document.getElementById(folderPickerTarget);
+    inp.value = folderCurrentPath;
+  }
+  closeFolderPicker();
+}
+
+// ── Create project submit ──
+document.getElementById('createForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = {
+    name: fd.get('name'),
+    image_dir: fd.get('image_dir'),
+    annotation_dir: fd.get('annotation_dir'),
+    task: fd.get('task'),
+    label_groups: labelGroupsData.filter(g => g.name.trim() && g.labels.length)
+        .map(g => ({ name: g.name.trim(), labels: g.labels })),
+  };
+  if (body.task === 'skeleton') {
+    body.keypoint_names = fd.get('keypoint_names').split('\n').map(s => s.trim()).filter(Boolean);
+    body.skeleton_edges = fd.get('skeleton_edges').split(',').map(s => {
+      const [a, b] = s.trim().split('-').map(Number);
+      return [a, b];
+    }).filter(e => e.length === 2 && !isNaN(e[0]));
+  }
+  const res = await fetch('/create', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  if (res.ok) location.reload();
+  else document.getElementById('createError').textContent = data.error || 'Error';
+});
+
+async function deleteProject(pid) {
+  if (!confirm('Delete project?')) return;
+  await fetch(`/api/project/${pid}/delete`, { method: 'POST' });
+  location.reload();
+}
+</script>
+{% endblock %}

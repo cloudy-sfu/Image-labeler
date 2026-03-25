@@ -1,0 +1,261 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }} – Annotate{% endblock %}
+{% block head %}
+<script>
+  const PROJECT = {{ project | tojson }};
+  const PID = {{ pid | tojson }};
+  const IMAGES = {{ images | tojson }};
+  const CURRENT = {{ current | tojson }};
+  const CURRENT_IDX = {{ current_idx }};
+  const TASK_DISPLAY = {{ task_display | tojson }};
+</script>
+{% endblock %}
+{% block body %}
+<div class="annotate-layout">
+
+  <header class="toolbar">
+    <a href="/" class="toolbar-brand">🏷️ Image Labeler</a>
+    <span class="toolbar-title">{{ project.name }}
+      <span class="badge">{{ task_display.get(project.task, project.task) }}</span>
+      — <b>{{ current }}</b>
+      ({{ current_idx + 1 }}/{{ images|length }})</span>
+    <div class="toolbar-tools" id="toolButtons"></div>
+    <div class="toolbar-actions">
+      <button class="btn-sm" id="btnSettings" title="Edit labels / project settings">⚙️ Labels</button>
+      <span class="toolbar-sep"></span>
+      <button class="btn-sm" id="btnUndo" title="Undo (Ctrl+Z)" disabled>↩ Undo</button>
+      <button class="btn-sm" id="btnRedo" title="Redo (Ctrl+Y)" disabled>↪ Redo</button>
+      <span class="toolbar-sep"></span>
+      <button class="btn-sm" id="btnPrev" title="Previous (A)">◀ Prev</button>
+      <button class="btn-sm" id="btnNext" title="Next (D)">Next ▶</button>
+      <button class="btn-sm btn-primary" id="btnSave" title="Save (Ctrl+S)">💾 Save</button>
+    </div>
+  </header>
+
+  <aside class="sidebar-left" id="imageList">
+    {% for img in images %}
+    <div class="img-item{% if img == current %} active{% endif %}"
+         data-file="{{ img }}"
+         onclick="navigateTo('{{ img }}')">
+      <span class="img-dot" id="dot-{{ loop.index0 }}"></span>
+      {{ img }}
+    </div>
+    {% endfor %}
+  </aside>
+
+  <main class="canvas-wrap">
+    <canvas id="mainCanvas"></canvas>
+    <div class="canvas-info" id="canvasInfo"></div>
+  </main>
+
+  <aside class="sidebar-right" id="annotationPanel">
+    <h3>Annotations</h3>
+    <div id="annList"></div>
+    <div id="labelEditor" style="display:none">
+      <h4>Labels</h4>
+      <div id="labelFields"></div>
+    </div>
+    <div id="brushSizeWrap" style="display:none">
+      <label>Brush size: <input type="range" id="brushSize" min="1" max="80" value="15">
+        <span id="brushSizeVal">15</span></label>
+      <label><input type="checkbox" id="eraserToggle"> Eraser</label>
+    </div>
+  </aside>
+
+</div>
+<!-- Project settings modal -->
+<div class="modal-overlay" id="settingsModal" style="display:none">
+  <div class="modal-dialog settings-dialog">
+    <div class="modal-header">
+      <h3>⚙️ Project Labels</h3>
+      <button class="btn-sm" onclick="closeSettings()">✕</button>
+    </div>
+    <div class="settings-body">
+      <p class="muted" style="font-size:12px;margin-bottom:10px;">
+        Add, remove, or rename labels. Removing labels already used in
+        saved annotations may cause mismatches — you will be warned.
+      </p>
+      <div id="settingsGroupsContainer"></div>
+      <button type="button" class="btn-sm" onclick="settingsAddGroup()">+ Add group</button>
+    </div>
+    <div class="modal-footer">
+      <div id="settingsWarning" class="error" style="flex:1;font-size:12px;"></div>
+      <button class="btn-sm" onclick="closeSettings()">Cancel</button>
+      <button class="btn-primary" id="settingsSaveBtn" onclick="saveSettings()">Save changes</button>
+    </div>
+  </div>
+</div>
+
+<!-- Label editor modal (reused from index, standalone here) -->
+<div class="modal-overlay" id="settingsLabelModal" style="display:none">
+  <div class="modal-dialog label-editor-dialog">
+    <div class="modal-header">
+      <h3>Edit Labels</h3>
+      <button class="btn-sm" onclick="closeSettingsLabelEditor()">✕</button>
+    </div>
+    <div class="label-editor-body">
+      <p class="muted" style="font-size:12px;margin-bottom:8px;">
+        One label per row. Label name is required; description is optional.
+      </p>
+      <div id="settingsLabelRows"></div>
+      <button type="button" class="btn-sm" onclick="settingsAddLabelRow()">+ Add label</button>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-sm" onclick="closeSettingsLabelEditor()">Cancel</button>
+      <button class="btn-primary" onclick="confirmSettingsLabelEditor()">OK</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Settings modal logic ──────────────────────────────────────────
+let settingsGroups = [];  // working copy
+let settingsEditIdx = -1;
+let settingsEditLabels = [];
+
+document.getElementById('btnSettings').addEventListener('click', openSettings);
+
+async function openSettings() {
+  // Fetch latest from server (in case another tab changed it)
+  const res = await fetch(`/api/project/${PID}/settings`);
+  const data = await res.json();
+  settingsGroups = JSON.parse(JSON.stringify(data.label_groups || []));
+  document.getElementById('settingsWarning').textContent = '';
+  renderSettingsGroups();
+  document.getElementById('settingsModal').style.display = '';
+}
+
+function closeSettings() {
+  document.getElementById('settingsModal').style.display = 'none';
+}
+
+function renderSettingsGroups() {
+  const c = document.getElementById('settingsGroupsContainer');
+  c.innerHTML = '';
+  settingsGroups.forEach((g, gi) => {
+    const div = document.createElement('div');
+    div.className = 'label-group-row';
+
+    const nameInput = document.createElement('input');
+    nameInput.placeholder = 'Group name';
+    nameInput.value = g.name;
+    nameInput.addEventListener('input', () => { g.name = nameInput.value; });
+
+    const summary = document.createElement('span');
+    summary.className = 'lg-summary';
+    summary.textContent = g.labels.length
+      ? g.labels.map(l => l.name).join(', ')
+      : '(no labels)';
+
+    const editBtn = document.createElement('button');
+    editBtn.type = 'button';
+    editBtn.className = 'btn-sm';
+    editBtn.textContent = '✏️ Edit';
+    editBtn.addEventListener('click', () => openSettingsLabelEditor(gi));
+
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.className = 'btn-sm btn-danger';
+    delBtn.textContent = '×';
+    delBtn.addEventListener('click', () => {
+      settingsGroups.splice(gi, 1);
+      renderSettingsGroups();
+    });
+
+    div.appendChild(nameInput);
+    div.appendChild(summary);
+    div.appendChild(editBtn);
+    div.appendChild(delBtn);
+    c.appendChild(div);
+  });
+}
+
+function settingsAddGroup() {
+  settingsGroups.push({ name: '', labels: [] });
+  renderSettingsGroups();
+}
+
+// ── Nested label editor ──
+function openSettingsLabelEditor(gi) {
+  settingsEditIdx = gi;
+  settingsEditLabels = JSON.parse(JSON.stringify(settingsGroups[gi].labels));
+  if (!settingsEditLabels.length) settingsEditLabels.push({ name: '', description: '' });
+  renderSettingsLabelRows();
+  document.getElementById('settingsLabelModal').style.display = '';
+}
+
+function closeSettingsLabelEditor() {
+  document.getElementById('settingsLabelModal').style.display = 'none';
+}
+
+function renderSettingsLabelRows() {
+  const c = document.getElementById('settingsLabelRows');
+  c.innerHTML = '';
+  settingsEditLabels.forEach((lbl, li) => {
+    const row = document.createElement('div');
+    row.className = 'label-editor-row';
+    row.innerHTML = `
+      <input class="le-name" placeholder="Label name" value="">
+      <input class="le-desc" placeholder="Description (optional)" value="">
+      <button type="button" class="btn-sm btn-danger le-del">×</button>
+    `;
+    row.querySelector('.le-name').value = lbl.name;
+    row.querySelector('.le-desc').value = lbl.description || '';
+    row.querySelector('.le-name').addEventListener('input', e => { lbl.name = e.target.value; });
+    row.querySelector('.le-desc').addEventListener('input', e => { lbl.description = e.target.value; });
+    row.querySelector('.le-del').addEventListener('click', () => {
+      settingsEditLabels.splice(li, 1);
+      renderSettingsLabelRows();
+    });
+    c.appendChild(row);
+  });
+}
+
+function settingsAddLabelRow() {
+  settingsEditLabels.push({ name: '', description: '' });
+  renderSettingsLabelRows();
+  const inputs = document.querySelectorAll('#settingsLabelRows .le-name');
+  if (inputs.length) inputs[inputs.length - 1].focus();
+}
+
+function confirmSettingsLabelEditor() {
+  const valid = settingsEditLabels.filter(l => l.name.trim() !== '');
+  valid.forEach(l => { l.name = l.name.trim(); l.description = (l.description || '').trim(); });
+  settingsGroups[settingsEditIdx].labels = valid;
+  closeSettingsLabelEditor();
+  renderSettingsGroups();
+}
+
+// ── Save settings to server ──
+async function saveSettings() {
+  const cleaned = settingsGroups
+    .filter(g => g.name.trim() && g.labels.length)
+    .map(g => ({ name: g.name.trim(), labels: g.labels }));
+
+  const res = await fetch(`/api/project/${PID}/settings`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ label_groups: cleaned }),
+  });
+  const data = await res.json();
+
+  if (data.removed && data.removed.length) {
+    const msg = 'Warning — the following were removed and may affect existing annotations:\n• '
+      + data.removed.join('\n• ')
+      + '\n\nAlready-saved files are NOT automatically migrated.';
+    document.getElementById('settingsWarning').textContent = msg;
+    // Don't close — let user see the warning. They can click Cancel or Save again.
+    // But we DID already save, so update the local state.
+  } else {
+    closeSettings();
+  }
+
+  // Update the in-memory PROJECT so new annotations use updated labels
+  PROJECT.label_groups = cleaned;
+
+  // Reload the page to pick up new label groups everywhere
+  location.reload();
+}
+</script>
+<script src="{{ url_for('static', filename='annotate.js') }}"></script>
+{% endblock %}
