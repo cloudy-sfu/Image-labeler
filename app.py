@@ -476,6 +476,6 @@ def find_available_port(start_port: int, tries: int = 100):
 
 
 if __name__ == '__main__':
-    port = find_available_port(5000)
+    port = find_available_port(1024)
     webbrowser.open_new_tab(f'http://localhost:{port}')
     app.run(port=port)
