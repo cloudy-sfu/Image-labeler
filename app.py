@@ -17,6 +17,7 @@ from itertools import product as cart_product
 from pathlib import Path
 
 import numpy as np
+import yaml
 from PIL import Image, ImageDraw
 from flask import (
     Flask, render_template, request, jsonify,
@@ -27,6 +28,7 @@ from sam_engine import sam_engine
 
 executor = ThreadPoolExecutor(max_workers=2)
 sam_embed_status = {}
+settings_prune_status = {}
 app = Flask(__name__)
 app.secret_key = "labeler-secret"
 
@@ -47,10 +49,218 @@ TASK_KEYS = list(TASK_DISPLAY.keys())
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+def _next_unused_id(used: set[int]) -> int:
+    i = 0
+    while i in used:
+        i += 1
+    return i
+
+
+def _class_key_from_pairs(pairs: list[tuple[int, int]]) -> str:
+    return "|".join(f"{gid}:{lid}" for gid, lid in pairs)
+
+
+def _normalize_label_groups(new_groups: list[dict], old_groups: list[dict] | None = None) -> list[dict]:
+    """Normalize groups/labels and preserve stable IDs using explicit IDs, then index fallback."""
+    old_groups = old_groups or []
+    old_groups_clean = []
+    for i, g in enumerate(old_groups):
+        gid = g.get("group_id", i)
+        labels = []
+        for j, l in enumerate(g.get("labels", [])):
+            labels.append({
+                "label_id": l.get("label_id", j),
+                "name": l.get("name", ""),
+                "description": l.get("description", ""),
+            })
+        old_groups_clean.append({
+            "group_id": gid,
+            "name": g.get("name", ""),
+            "labels": labels,
+        })
+
+    used_group_ids = {int(g["group_id"]) for g in old_groups_clean if isinstance(g.get("group_id"), int)}
+    used_old_group_indexes = set()
+    out = []
+
+    for gi, g in enumerate(new_groups or []):
+        name = str(g.get("name", "")).strip()
+        raw_labels = g.get("labels", []) or []
+        old_group = None
+
+        incoming_gid = g.get("group_id")
+        if isinstance(incoming_gid, int):
+            for oi, og in enumerate(old_groups_clean):
+                if oi in used_old_group_indexes:
+                    continue
+                if og["group_id"] == incoming_gid:
+                    old_group = og
+                    used_old_group_indexes.add(oi)
+                    break
+
+        if old_group is None and gi < len(old_groups_clean) and gi not in used_old_group_indexes:
+            old_group = old_groups_clean[gi]
+            used_old_group_indexes.add(gi)
+
+        if old_group is None:
+            matches = [
+                (oi, og) for oi, og in enumerate(old_groups_clean)
+                if oi not in used_old_group_indexes and og.get("name") == name
+            ]
+            if len(matches) == 1:
+                oi, old_group = matches[0]
+                used_old_group_indexes.add(oi)
+
+        if old_group is not None:
+            gid = int(old_group["group_id"])
+        else:
+            gid = _next_unused_id(used_group_ids)
+            used_group_ids.add(gid)
+
+        old_labels = old_group.get("labels", []) if old_group else []
+        used_old_label_indexes = set()
+        used_label_ids = {int(l["label_id"]) for l in old_labels if isinstance(l.get("label_id"), int)}
+        labels_out = []
+
+        for li, l in enumerate(raw_labels):
+            lname = str(l.get("name", "")).strip()
+            ldesc = str(l.get("description", "") or "").strip()
+            old_label = None
+
+            incoming_lid = l.get("label_id")
+            if isinstance(incoming_lid, int):
+                for oi, ol in enumerate(old_labels):
+                    if oi in used_old_label_indexes:
+                        continue
+                    if ol["label_id"] == incoming_lid:
+                        old_label = ol
+                        used_old_label_indexes.add(oi)
+                        break
+
+            if old_label is None and li < len(old_labels) and li not in used_old_label_indexes:
+                old_label = old_labels[li]
+                used_old_label_indexes.add(li)
+
+            if old_label is None:
+                matches = [
+                    (oi, ol) for oi, ol in enumerate(old_labels)
+                    if oi not in used_old_label_indexes and ol.get("name") == lname
+                ]
+                if len(matches) == 1:
+                    oi, old_label = matches[0]
+                    used_old_label_indexes.add(oi)
+
+            if old_label is not None:
+                lid = int(old_label["label_id"])
+            else:
+                lid = _next_unused_id(used_label_ids)
+                used_label_ids.add(lid)
+
+            labels_out.append({"label_id": lid, "name": lname, "description": ldesc})
+
+        out.append({"group_id": gid, "name": name, "labels": labels_out})
+
+    return out
+
+
+def _build_class_catalog(label_groups: list[dict], old_catalog: list[dict] | None = None) -> list[dict]:
+    old_catalog = old_catalog or []
+    old_key_to_id = {}
+    used_ids = set()
+    for e in old_catalog:
+        try:
+            cid = int(e.get("class_id"))
+        except (TypeError, ValueError):
+            continue
+        key = e.get("key")
+        if not key:
+            continue
+        old_key_to_id[key] = cid
+        used_ids.add(cid)
+
+    dimensions = []
+    for g in label_groups:
+        rows = []
+        for l in g.get("labels", []):
+            rows.append((int(g.get("group_id", 0)), int(l.get("label_id", 0)), g.get("name", ""), l.get("name", "")))
+        if not rows:
+            return []
+        dimensions.append(rows)
+
+    out = []
+    kept_ids = set()
+    for combo in cart_product(*dimensions):
+        pairs = [(gid, lid) for gid, lid, _gn, _ln in combo]
+        key = _class_key_from_pairs(pairs)
+        labels = {gn: ln for _gid, _lid, gn, ln in combo}
+        if key in old_key_to_id:
+            cid = old_key_to_id[key]
+        else:
+            cid = _next_unused_id(used_ids | kept_ids)
+        kept_ids.add(cid)
+        out.append({"class_id": cid, "key": key, "labels": labels})
+
+    out.sort(key=lambda e: int(e["class_id"]))
+    return out
+
+
+def _upgrade_project_schema(project: dict) -> bool:
+    """Backfill stable IDs for groups/labels/classes on older projects."""
+    changed = False
+    normalized_groups = _normalize_label_groups(project.get("label_groups", []), project.get("label_groups", []))
+    if normalized_groups != project.get("label_groups", []):
+        project["label_groups"] = normalized_groups
+        changed = True
+
+    rebuilt_catalog = _build_class_catalog(project.get("label_groups", []), project.get("class_catalog", []))
+    if rebuilt_catalog != project.get("class_catalog", []):
+        project["class_catalog"] = rebuilt_catalog
+        changed = True
+    return changed
+
+
+def _label_lookup_maps(project: dict) -> tuple[list[dict], dict[str, int], dict[int, dict]]:
+    label_groups = project.get("label_groups", [])
+    dims = []
+    for g in label_groups:
+        gm = {}
+        for l in g.get("labels", []):
+            gm[l.get("name", "")] = int(l.get("label_id", 0))
+        dims.append({
+            "group_id": int(g.get("group_id", 0)),
+            "group_name": g.get("name", ""),
+            "name_to_label_id": gm,
+        })
+
+    key_to_cid = {}
+    cid_to_labels = {}
+    for e in project.get("class_catalog", []):
+        if not e.get("key"):
+            continue
+        key_to_cid[e["key"]] = int(e["class_id"])
+        cid_to_labels[int(e["class_id"])] = e.get("labels", {})
+    return dims, key_to_cid, cid_to_labels
+
+
+def _default_class_id(project: dict) -> int:
+    cats = project.get("class_catalog", [])
+    if not cats:
+        return 0
+    return min(int(c.get("class_id", 0)) for c in cats)
+
+
 def load_projects() -> dict:
-    if PROJECTS_FILE.exists():
-        return json.loads(PROJECTS_FILE.read_text())
-    return {}
+    if not PROJECTS_FILE.exists():
+        return {}
+
+    projects = json.loads(PROJECTS_FILE.read_text())
+    changed = False
+    for p in projects.values():
+        changed = _upgrade_project_schema(p) or changed
+
+    if changed:
+        save_projects(projects)
+    return projects
 
 
 def save_projects(projects: dict):
@@ -67,29 +277,31 @@ def image_files(image_dir: str) -> list[str]:
     return out
 
 
-def composite_classes(label_groups: list[dict]) -> dict[int, dict]:
-    """Cartesian product of label groups → {class_id: {group: label}}."""
-    if not label_groups:
-        return {}
-    names = [g["name"] for g in label_groups]
-    values = [g["labels"] for g in label_groups]
-    return {
-        i: dict(zip(names, combo))
-        for i, combo in enumerate(cart_product(*[
-            [lb["name"] for lb in v] for v in values
-        ]))
-    }
+def composite_classes(project: dict) -> dict[int, dict]:
+    out = {}
+    for e in project.get("class_catalog", []):
+        out[int(e.get("class_id", 0))] = e.get("labels", {})
+    return out
 
 
-def labels_to_cid(labels: dict, label_groups: list[dict]) -> int:
-    for cid, combo in composite_classes(label_groups).items():
-        if combo == labels:
-            return cid
-    return 0
+def labels_to_cid(labels: dict, project: dict) -> int:
+    dimensions, key_to_cid, _cid_to_labels_map = _label_lookup_maps(project)
+    pairs = []
+    for d in dimensions:
+        gname = d["group_name"]
+        lname = labels.get(gname)
+        if lname not in d["name_to_label_id"]:
+            return _default_class_id(project)
+        pairs.append((d["group_id"], d["name_to_label_id"][lname]))
+    key = _class_key_from_pairs(pairs)
+    if key in key_to_cid:
+        return key_to_cid[key]
+    return _default_class_id(project)
 
 
-def cid_to_labels(cid: int, label_groups: list[dict]) -> dict:
-    return composite_classes(label_groups).get(cid, {})
+def cid_to_labels(cid: int, project: dict) -> dict:
+    catalog = composite_classes(project)
+    return catalog.get(cid, {})
 
 
 def annotation_path(project: dict, image_name: str, mkdir=False) -> Path:
@@ -128,8 +340,12 @@ def _polygon_bbox(points: list[tuple[float, float]]) -> list[float]:
     return [x0, y0, x1 - x0, y1 - y0]
 
 
-def build_semantic_artifacts(project: dict, image_name: str, annotations: list[dict]) -> tuple[np.ndarray, dict, list[dict]]:
-    """Build semantic class-mask matrix + COCO-like sidecar, enforcing semantic constraints."""
+def semantic_mask_file(mask_dir: Path, image_stem: str, class_id: int) -> Path:
+    return mask_dir / f"{image_stem}__cid_{class_id}.npy"
+
+
+def build_semantic_artifacts(project: dict, image_name: str, annotations: list[dict]) -> tuple[dict[int, np.ndarray], dict, list[dict]]:
+    """Build per-class semantic masks + COCO-like sidecar, enforcing semantic constraints."""
     img_path = Path(project["image_dir"]) / image_name
     with Image.open(img_path) as im:
         width, height = im.size
@@ -139,7 +355,7 @@ def build_semantic_artifacts(project: dict, image_name: str, annotations: list[d
 
     total_pixels = width * height
     coverage = np.zeros((height, width), dtype=bool)
-    class_ids = np.zeros((height, width), dtype=np.int32)
+    class_ids = np.full((height, width), fill_value=-1, dtype=np.int32)
 
     by_class = defaultdict(list)
     class_area = defaultdict(int)
@@ -151,7 +367,7 @@ def build_semantic_artifacts(project: dict, image_name: str, annotations: list[d
         if len(poly) < 3:
             raise ValueError(f"Polygon #{ann_idx + 1} has fewer than 3 points")
 
-        cid = labels_to_cid(ann.get("labels", {}), project.get("label_groups", []))
+        cid = labels_to_cid(ann.get("labels", {}), project)
         px_poly = _poly_norm_to_pixels(poly, width, height)
 
         temp = Image.new("1", (width, height), 0)
@@ -191,10 +407,11 @@ def build_semantic_artifacts(project: dict, image_name: str, annotations: list[d
         pct = (uncovered / total_pixels) * 100.0
         raise ValueError(f"Semantic masks must tile the image. Uncovered pixels: {uncovered} ({pct:.2f}%)")
 
-    cats = composite_classes(project.get("label_groups", []))
-    class_count = len(cats)
-    class_masks = (class_ids[None, :, :] == np.arange(class_count, dtype=np.int32)[:, None, None])
+    cats = composite_classes(project)
+    sorted_class_ids = sorted(int(cid) for cid in cats.keys())
+    class_masks = {cid: (class_ids == cid) for cid in sorted_class_ids}
     category_names = {cid: "_".join(v.values()) for cid, v in cats.items()}
+    stem = Path(image_name).stem
 
     anns_out = []
     ann_id = 1
@@ -226,9 +443,12 @@ def build_semantic_artifacts(project: dict, image_name: str, annotations: list[d
             for cid, combo in sorted(cats.items())
         ],
         "annotations": anns_out,
-        "mask_encoding": "one_hot_matrix_npz",
-        "mask_axes": ["class", "height", "width"],
-        "mask_shape": [int(class_masks.shape[0]), int(class_masks.shape[1]), int(class_masks.shape[2])],
+        "mask_encoding": "per_class_npy_hw",
+        "mask_shape": [height, width],
+        "mask_files": {
+            str(cid): semantic_mask_file(Path("."), stem, cid).name
+            for cid in sorted_class_ids
+        },
     }
     return class_masks, sidecar, kept_annotations
 
@@ -236,14 +456,15 @@ def build_semantic_artifacts(project: dict, image_name: str, annotations: list[d
 def write_data_yaml(project: dict):
     ann_dir = Path(project["annotation_dir"])
     ann_dir.mkdir(parents=True, exist_ok=True)
-    cmap = composite_classes(project["label_groups"])
+    cmap = composite_classes(project)
     names = {i: "_".join(v.values()) for i, v in cmap.items()}
     content = {
         "path": project["image_dir"],
         "train": ".",
         "val": ".",
         "names": names,
-        "nc": len(names),
+        "nc": (max(names.keys()) + 1) if names else 0,
+        "class_ids": sorted(names.keys()),
         "label_groups": project["label_groups"],
     }
     if project["task"] == "skeleton":
@@ -252,8 +473,144 @@ def write_data_yaml(project: dict):
         content["skeleton_edges"] = project.get("skeleton_edges", [])
     elif project["task"] == "semantic_segmentation":
         content["mask_dir"] = "masks"
-        content["mask_format"] = "npz_one_hot_chw"
-    (ann_dir / "data.yaml").write_text(json.dumps(content, indent=2))
+        content["mask_format"] = "npy_per_class_hw"
+    (ann_dir / "data.yaml").write_text(yaml.safe_dump(content, sort_keys=False))
+
+
+def _prune_annotations_for_deleted_classes(project: dict, deleted_class_ids: set[int]) -> dict:
+    """Delete references to removed classes in saved annotations and semantic mask files."""
+    stats = {"files_rewritten": 0, "annotations_removed": 0, "images_touched": 0}
+    if not deleted_class_ids:
+        return stats
+
+    task = project.get("task")
+    for image_name in image_files(project["image_dir"]):
+        ap = annotation_path(project, image_name)
+        changed = False
+        removed_here = 0
+
+        if ap.exists():
+            raw = ap.read_text().strip()
+
+            if task == "classification":
+                if raw:
+                    cid = int(raw.split()[0])
+                    if cid in deleted_class_ids:
+                        ap.write_text("")
+                        changed = True
+                        removed_here = 1
+
+            elif task == "semantic_segmentation":
+                if raw:
+                    try:
+                        payload = json.loads(raw)
+                    except json.JSONDecodeError:
+                        payload = None
+
+                    if isinstance(payload, dict):
+                        anns = payload.get("annotations", [])
+                        kept = [a for a in anns if int(a.get("class_id", -1)) not in deleted_class_ids]
+                        removed_here = len(anns) - len(kept)
+                        if removed_here:
+                            payload["annotations"] = kept
+                            ap.write_text(json.dumps(payload, indent=2))
+                            changed = True
+                    else:
+                        lines = [ln for ln in raw.splitlines() if ln.strip()]
+                        kept_lines = []
+                        for line in lines:
+                            parts = line.split()
+                            if not parts:
+                                continue
+                            if int(parts[0]) in deleted_class_ids:
+                                removed_here += 1
+                            else:
+                                kept_lines.append(line)
+                        if removed_here:
+                            ap.write_text("\n".join(kept_lines) + ("\n" if kept_lines else ""))
+                            changed = True
+
+            else:
+                if raw:
+                    lines = [ln for ln in raw.splitlines() if ln.strip()]
+                    kept_lines = []
+                    for line in lines:
+                        parts = line.split()
+                        if not parts:
+                            continue
+                        if int(parts[0]) in deleted_class_ids:
+                            removed_here += 1
+                        else:
+                            kept_lines.append(line)
+                    if removed_here:
+                        ap.write_text("\n".join(kept_lines) + ("\n" if kept_lines else ""))
+                        changed = True
+
+        if task == "semantic_segmentation":
+            stem = Path(image_name).stem
+            mask_dir = semantic_mask_dir(project, mkdir=True)
+            legacy_npz = mask_dir / f"{stem}.npz"
+            if legacy_npz.exists():
+                legacy_npz.unlink(missing_ok=True)
+                changed = True
+            for cid in deleted_class_ids:
+                mp = semantic_mask_file(mask_dir, stem, cid)
+                if mp.exists():
+                    mp.unlink(missing_ok=True)
+                    changed = True
+
+            sidecar_path = mask_dir / f"{stem}.coco.json"
+            if sidecar_path.exists():
+                try:
+                    sidecar = json.loads(sidecar_path.read_text())
+                except json.JSONDecodeError:
+                    sidecar = None
+                if isinstance(sidecar, dict):
+                    anns = sidecar.get("annotations", [])
+                    cats = sidecar.get("categories", [])
+                    kept_anns = [a for a in anns if int(a.get("category_id", -1)) not in deleted_class_ids]
+                    kept_cats = [c for c in cats if int(c.get("id", -1)) not in deleted_class_ids]
+                    new_mask_files = {
+                        k: v for k, v in (sidecar.get("mask_files") or {}).items()
+                        if int(k) not in deleted_class_ids
+                    }
+                    if len(kept_anns) != len(anns) or len(kept_cats) != len(cats) or len(new_mask_files) != len(sidecar.get("mask_files") or {}):
+                        sidecar["annotations"] = kept_anns
+                        sidecar["categories"] = kept_cats
+                        sidecar["mask_files"] = new_mask_files
+                        sidecar_path.write_text(json.dumps(sidecar, indent=2))
+                        changed = True
+
+        if changed:
+            stats["files_rewritten"] += 1
+            stats["annotations_removed"] += removed_here
+            stats["images_touched"] += 1
+
+    return stats
+
+
+def _run_settings_prune_job(job_id: str, project_snapshot: dict, deleted_class_ids: list[int]):
+    settings_prune_status[job_id] = {
+        "status": "running",
+        "deleted_class_ids": deleted_class_ids,
+        "stats": None,
+        "error": None,
+    }
+    try:
+        stats = _prune_annotations_for_deleted_classes(project_snapshot, set(deleted_class_ids))
+        settings_prune_status[job_id] = {
+            "status": "done",
+            "deleted_class_ids": deleted_class_ids,
+            "stats": stats,
+            "error": None,
+        }
+    except Exception as e:
+        settings_prune_status[job_id] = {
+            "status": "error",
+            "deleted_class_ids": deleted_class_ids,
+            "stats": None,
+            "error": str(e),
+        }
 
 
 # ── routes ───────────────────────────────────────────────────────────────────
@@ -276,12 +633,15 @@ def create_project():
     if task not in TASK_KEYS:
         return jsonify(error=f"Unsupported task: {task}"), 400
     pid = uuid.uuid4().hex[:12]
+    raw_groups = data.get("label_groups", [])
+    norm_groups = _normalize_label_groups(raw_groups, [])
     project = {
         "name": data["name"],
         "image_dir": data["image_dir"],
         "annotation_dir": data["annotation_dir"],
         "task": task,
-        "label_groups": data.get("label_groups", []),
+        "label_groups": norm_groups,
+        "class_catalog": _build_class_catalog(norm_groups, []),
         "keypoint_names": data.get("keypoint_names", []),
         "skeleton_edges": data.get("skeleton_edges", []),
     }
@@ -359,13 +719,11 @@ def get_annotation(pid, filename):
         return jsonify(annotations=[], mask=None)
 
     task = p["task"]
-    lg = p["label_groups"]
-
     if task == "classification":
         text = ap.read_text().strip()
         if text:
             cid = int(text.split()[0])
-            return jsonify(annotations=[{"class_id": cid, "labels": cid_to_labels(cid, lg)}])
+            return jsonify(annotations=[{"class_id": cid, "labels": cid_to_labels(cid, p)}])
         return jsonify(annotations=[])
 
     if task == "semantic_segmentation":
@@ -376,7 +734,7 @@ def get_annotation(pid, filename):
             payload = json.loads(raw)
             anns = payload.get("annotations", [])
             for ann in anns:
-                ann.setdefault("labels", cid_to_labels(ann.get("class_id", 0), lg))
+                ann.setdefault("labels", cid_to_labels(ann.get("class_id", 0), p))
             return jsonify(annotations=anns)
         except json.JSONDecodeError:
             # Backward compatibility for projects saved before semantic JSON format.
@@ -388,7 +746,7 @@ def get_annotation(pid, filename):
                 cid = int(parts[0])
                 coords = list(map(float, parts[1:]))
                 points = [[coords[i], coords[i + 1]] for i in range(0, len(coords), 2)]
-                anns.append({"class_id": cid, "labels": cid_to_labels(cid, lg), "polygon": points})
+                anns.append({"class_id": cid, "labels": cid_to_labels(cid, p), "polygon": points})
             return jsonify(annotations=anns)
 
     annotations_out = []
@@ -397,7 +755,7 @@ def get_annotation(pid, filename):
         if not parts:
             continue
         cid = int(parts[0])
-        labels = cid_to_labels(cid, lg)
+        labels = cid_to_labels(cid, p)
         if task == "detection":
             cx, cy, w, h = map(float, parts[1:5])
             annotations_out.append({"class_id": cid, "labels": labels,
@@ -427,14 +785,13 @@ def save_annotation(pid, filename):
     p = projects[pid]
     data = request.get_json()
     task = p["task"]
-    lg = p["label_groups"]
     ap = annotation_path(p, filename, mkdir=True)
 
 
     if task == "classification":
         anns = data.get("annotations", [])
         if anns:
-            cid = labels_to_cid(anns[0].get("labels", {}), lg)
+            cid = labels_to_cid(anns[0].get("labels", {}), p)
             ap.write_text(str(cid) + "\n")
         else:
             ap.write_text("")
@@ -458,13 +815,17 @@ def save_annotation(pid, filename):
 
         stem = Path(filename).stem
         mask_dir = semantic_mask_dir(p, mkdir=True)
-        np.savez_compressed(mask_dir / f"{stem}.npz", masks=class_masks)
+        (mask_dir / f"{stem}.npz").unlink(missing_ok=True)
+        for old_mask in mask_dir.glob(f"{stem}__cid_*.npy"):
+            old_mask.unlink(missing_ok=True)
+        for cid, mask in class_masks.items():
+            np.save(semantic_mask_file(mask_dir, stem, int(cid)), mask.astype(np.uint8))
         (mask_dir / f"{stem}.coco.json").write_text(json.dumps(sidecar, indent=2))
         return jsonify(ok=True)
 
     lines = []
     for ann in data.get("annotations", []):
-        cid = labels_to_cid(ann.get("labels", {}), lg)
+        cid = labels_to_cid(ann.get("labels", {}), p)
         if task == "detection":
             b = ann["bbox"]
             lines.append(f"{cid} {b[0]:.6f} {b[1]:.6f} {b[2]:.6f} {b[3]:.6f}")
@@ -592,26 +953,33 @@ def update_project_settings(pid):
     projects = load_projects()
     if pid not in projects:
         abort(404)
-    data = request.get_json()
+    data = request.get_json() or {}
     p = projects[pid]
 
-    # ── Detect removed labels and warn caller ──
-    old_groups = {g["name"]: {l["name"] for l in g["labels"]}
-                  for g in p.get("label_groups", [])}
-    new_groups_raw = data.get("label_groups", [])
-    removed = []
-    for g in p.get("label_groups", []):
-        new_g = next((ng for ng in new_groups_raw if ng["name"] == g["name"]), None)
-        if new_g is None:
-            removed.append(f"group '{g['name']}' (entire group)")
-        else:
-            new_names = {l["name"] for l in new_g["labels"]}
-            for l in g["labels"]:
-                if l["name"] not in new_names:
-                    removed.append(f"label '{l['name']}' in group '{g['name']}'")
+    old_groups = p.get("label_groups", [])
+    old_catalog = p.get("class_catalog", [])
+    new_groups = _normalize_label_groups(data.get("label_groups", []), old_groups)
+    new_catalog = _build_class_catalog(new_groups, old_catalog)
+
+    old_ids = {int(c.get("class_id", -1)) for c in old_catalog}
+    new_ids = {int(c.get("class_id", -1)) for c in new_catalog}
+    deleted_class_ids = {cid for cid in old_ids if cid not in new_ids and cid >= 0}
+    confirmed = bool(data.get("confirm_deletion", False))
+
+    removed = [f"class_id {cid}" for cid in sorted(deleted_class_ids)]
+
+    # Preflight: require explicit confirmation before applying destructive class deletions.
+    if deleted_class_ids and not confirmed:
+        return jsonify(
+            ok=False,
+            requires_confirmation=True,
+            removed=removed,
+            deleted_class_ids=sorted(deleted_class_ids),
+        )
 
     # Apply
-    p["label_groups"] = new_groups_raw
+    p["label_groups"] = new_groups
+    p["class_catalog"] = new_catalog
     if p["task"] == "skeleton":
         if "keypoint_names" in data:
             p["keypoint_names"] = data["keypoint_names"]
@@ -620,7 +988,38 @@ def update_project_settings(pid):
 
     save_projects(projects)
     write_data_yaml(p)
-    return jsonify(ok=True, removed=removed)
+
+    prune_job_id = None
+    if deleted_class_ids:
+        prune_job_id = uuid.uuid4().hex
+        ids = sorted(deleted_class_ids)
+        project_snapshot = json.loads(json.dumps(p))
+        settings_prune_status[prune_job_id] = {
+            "status": "pending",
+            "deleted_class_ids": ids,
+            "stats": None,
+            "error": None,
+        }
+        executor.submit(_run_settings_prune_job, prune_job_id, project_snapshot, ids)
+
+    return jsonify(
+        ok=True,
+        removed=removed,
+        deleted_class_ids=sorted(deleted_class_ids),
+        prune_job_id=prune_job_id,
+        prune_status=(settings_prune_status.get(prune_job_id, {}).get("status") if prune_job_id else None),
+    )
+
+
+@app.route("/api/project/<pid>/settings/prune_status/<job_id>", methods=["GET"])
+def settings_prune_job_status(pid, job_id):
+    projects = load_projects()
+    if pid not in projects:
+        abort(404)
+    info = settings_prune_status.get(job_id)
+    if info is None:
+        return jsonify(error="Unknown prune job"), 404
+    return jsonify(job_id=job_id, **info)
 
 
 def find_available_port(start_port: int, tries: int = 100):

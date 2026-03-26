@@ -74,7 +74,6 @@
       <button type="button" class="btn-sm" onclick="settingsAddGroup()">+ Add group</button>
     </div>
     <div class="modal-footer">
-      <div id="settingsWarning" class="error" style="flex:1;font-size:12px;"></div>
       <button class="btn-sm" onclick="closeSettings()">Cancel</button>
       <button class="btn-primary" id="settingsSaveBtn" onclick="saveSettings()">Save changes</button>
     </div>
@@ -115,7 +114,6 @@ async function openSettings() {
   const res = await fetch(`/api/project/${PID}/settings`);
   const data = await res.json();
   settingsGroups = JSON.parse(JSON.stringify(data.label_groups || []));
-  document.getElementById('settingsWarning').textContent = '';
   renderSettingsGroups();
   document.getElementById('settingsModal').style.display = '';
 }
@@ -225,24 +223,59 @@ function confirmSettingsLabelEditor() {
 async function saveSettings() {
   const cleaned = settingsGroups
     .filter(g => g.name.trim() && g.labels.length)
-    .map(g => ({ name: g.name.trim(), labels: g.labels }));
+    .map(g => ({
+      group_id: Number.isInteger(g.group_id) ? g.group_id : undefined,
+      name: g.name.trim(),
+      labels: g.labels.map(l => ({
+        label_id: Number.isInteger(l.label_id) ? l.label_id : undefined,
+        name: (l.name || '').trim(),
+        description: (l.description || '').trim(),
+      })),
+    }));
 
-  const res = await fetch(`/api/project/${PID}/settings`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ label_groups: cleaned }),
-  });
-  const data = await res.json();
+  async function submitSettings(confirmDeletion) {
+    const res = await fetch(`/api/project/${PID}/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label_groups: cleaned, confirm_deletion: !!confirmDeletion }),
+    });
+    return res.json();
+  }
 
-  if (data.removed && data.removed.length) {
-    const msg = 'Warning — the following were removed and may affect existing annotations:\n• '
-      + data.removed.join('\n• ')
-      + '\n\nAlready-saved files are NOT automatically migrated.';
-    document.getElementById('settingsWarning').textContent = msg;
-    // Don't close — let user see the warning. They can click Cancel or Save again.
-    // But we DID already save, so update the local state.
-  } else {
-    closeSettings();
+  let data = await submitSettings(false);
+  if (data.requires_confirmation) {
+    const ok = confirm(
+      `Deleting classes will remove existing annotations and mask files for class IDs:\n${(data.removed || []).join('\n')}\n\nClick OK to continue, or Cancel to abort.`
+    );
+    if (!ok) return;
+    data = await submitSettings(true);
+  }
+
+  if (!data.ok) {
+    alert(data.error || 'Failed to save settings.');
+    return;
+  }
+
+  closeSettings();
+
+  if (data.prune_job_id) {
+    // Poll async cleanup so settings save stays responsive for large datasets.
+    const started = Date.now();
+    while (Date.now() - started < 10000) {
+      await new Promise(r => setTimeout(r, 800));
+      const stRes = await fetch(`/api/project/${PID}/settings/prune_status/${data.prune_job_id}`);
+      if (!stRes.ok) break;
+      const st = await stRes.json();
+      if (st.status === 'done') {
+        const removedCount = st.stats?.annotations_removed ?? 0;
+        alert(`Class deletion cleanup finished. Removed annotations: ${removedCount}.`);
+        break;
+      }
+      if (st.status === 'error') {
+        alert(`Class deletion cleanup failed: ${st.error || 'Unknown error'}`);
+        break;
+      }
+    }
   }
 
   // Update the in-memory PROJECT so new annotations use updated labels
