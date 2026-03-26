@@ -1,7 +1,7 @@
 """
 Flask-based image annotation tool with YOLO-format output.
 Supports: classification, detection, instance segmentation,
-skeleton/pose annotation.
+semantic segmentation, skeleton/pose annotation.
 Ref: https://docs.ultralytics.com/datasets/
 """
 import hashlib
@@ -11,11 +11,13 @@ import socket
 import sys
 import uuid
 import webbrowser
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from itertools import product as cart_product
 from pathlib import Path
 
-from PIL import Image
+import numpy as np
+from PIL import Image, ImageDraw
 from flask import (
     Flask, render_template, request, jsonify,
     send_file, redirect, url_for, abort
@@ -37,6 +39,7 @@ TASK_DISPLAY = {
     "classification": "Classification",
     "detection": "Object detection",
     "instance_segmentation": "Instance segmentation (polygon)",
+    "semantic_segmentation": "Semantic segmentation (mask)",
     "skeleton": "Skeleton (pose) estimation",
 }
 TASK_KEYS = list(TASK_DISPLAY.keys())
@@ -95,7 +98,139 @@ def annotation_path(project: dict, image_name: str, mkdir=False) -> Path:
     d = ann_dir / "labels"
     if mkdir:
         d.mkdir(parents=True, exist_ok=True)
-    return d / (stem + ".txt")
+    suffix = ".json" if project.get("task") == "semantic_segmentation" else ".txt"
+    return d / (stem + suffix)
+
+
+def semantic_mask_dir(project: dict, mkdir=False) -> Path:
+    d = Path(project["annotation_dir"]) / "masks"
+    if mkdir:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _poly_norm_to_pixels(poly: list[list[float]], width: int, height: int) -> list[tuple[float, float]]:
+    max_x = max(width - 1, 0)
+    max_y = max(height - 1, 0)
+    out = []
+    for x, y in poly:
+        px = min(max(float(x), 0.0), 1.0) * max_x
+        py = min(max(float(y), 0.0), 1.0) * max_y
+        out.append((px, py))
+    return out
+
+
+def _polygon_bbox(points: list[tuple[float, float]]) -> list[float]:
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    return [x0, y0, x1 - x0, y1 - y0]
+
+
+def build_semantic_artifacts(project: dict, image_name: str, annotations: list[dict]) -> tuple[np.ndarray, dict, list[dict]]:
+    """Build semantic class-mask matrix + COCO-like sidecar, enforcing semantic constraints."""
+    img_path = Path(project["image_dir"]) / image_name
+    with Image.open(img_path) as im:
+        width, height = im.size
+
+    if width <= 0 or height <= 0:
+        raise ValueError("Invalid image size")
+
+    total_pixels = width * height
+    coverage = np.zeros((height, width), dtype=bool)
+    class_ids = np.zeros((height, width), dtype=np.int32)
+
+    by_class = defaultdict(list)
+    class_area = defaultdict(int)
+    class_bbox = {}
+    kept_annotations = []
+
+    for ann_idx, ann in enumerate(annotations):
+        poly = ann.get("polygon") or []
+        if len(poly) < 3:
+            raise ValueError(f"Polygon #{ann_idx + 1} has fewer than 3 points")
+
+        cid = labels_to_cid(ann.get("labels", {}), project.get("label_groups", []))
+        px_poly = _poly_norm_to_pixels(poly, width, height)
+
+        temp = Image.new("1", (width, height), 0)
+        ImageDraw.Draw(temp).polygon(px_poly, fill=1)
+        poly_mask = np.asarray(temp, dtype=bool)
+
+        # Semantic retreat: existing (earlier) mask keeps ownership.
+        new_pixels = poly_mask & ~coverage
+        contributed_pixels = int(np.count_nonzero(new_pixels))
+
+        if contributed_pixels <= 0:
+            continue
+
+        coverage |= new_pixels
+        class_ids[new_pixels] = cid
+        class_area[cid] += contributed_pixels
+
+        by_class[cid].append(px_poly)
+        bb = _polygon_bbox(px_poly)
+        if cid not in class_bbox:
+            class_bbox[cid] = bb
+        else:
+            x0 = min(class_bbox[cid][0], bb[0])
+            y0 = min(class_bbox[cid][1], bb[1])
+            x1 = max(class_bbox[cid][0] + class_bbox[cid][2], bb[0] + bb[2])
+            y1 = max(class_bbox[cid][1] + class_bbox[cid][3], bb[1] + bb[3])
+            class_bbox[cid] = [x0, y0, x1 - x0, y1 - y0]
+        kept_annotations.append({
+            "class_id": cid,
+            "labels": ann.get("labels", {}),
+            "polygon": ann.get("polygon", []),
+        })
+
+    covered = int(np.count_nonzero(coverage))
+    uncovered = total_pixels - covered
+    if uncovered:
+        pct = (uncovered / total_pixels) * 100.0
+        raise ValueError(f"Semantic masks must tile the image. Uncovered pixels: {uncovered} ({pct:.2f}%)")
+
+    cats = composite_classes(project.get("label_groups", []))
+    class_count = len(cats)
+    class_masks = (class_ids[None, :, :] == np.arange(class_count, dtype=np.int32)[:, None, None])
+    category_names = {cid: "_".join(v.values()) for cid, v in cats.items()}
+
+    anns_out = []
+    ann_id = 1
+    for cid, polys in sorted(by_class.items()):
+        anns_out.append({
+            "id": ann_id,
+            "category_id": cid,
+            "category_name": category_names.get(cid, str(cid)),
+            "iscrowd": 0,
+            "area": class_area[cid],
+            "bbox": [round(v, 2) for v in class_bbox.get(cid, [0, 0, 0, 0])],
+            # COCO-style list of polygon rings in absolute pixel coordinates.
+            "segmentation": [
+                [round(coord, 2) for xy in poly for coord in xy]
+                for poly in polys
+            ],
+        })
+        ann_id += 1
+
+    sidecar = {
+        "format": "semantic_maskrcnn_v1",
+        "image": {
+            "file_name": image_name,
+            "width": width,
+            "height": height,
+        },
+        "categories": [
+            {"id": cid, "name": category_names.get(cid, str(cid)), "labels": combo}
+            for cid, combo in sorted(cats.items())
+        ],
+        "annotations": anns_out,
+        "mask_encoding": "one_hot_matrix_npz",
+        "mask_axes": ["class", "height", "width"],
+        "mask_shape": [int(class_masks.shape[0]), int(class_masks.shape[1]), int(class_masks.shape[2])],
+    }
+    return class_masks, sidecar, kept_annotations
 
 
 def write_data_yaml(project: dict):
@@ -115,6 +250,9 @@ def write_data_yaml(project: dict):
         content["kpt_shape"] = [len(project.get("keypoint_names", [])), 3]
         content["keypoint_names"] = project.get("keypoint_names", [])
         content["skeleton_edges"] = project.get("skeleton_edges", [])
+    elif project["task"] == "semantic_segmentation":
+        content["mask_dir"] = "masks"
+        content["mask_format"] = "npz_one_hot_chw"
     (ann_dir / "data.yaml").write_text(json.dumps(content, indent=2))
 
 
@@ -230,6 +368,29 @@ def get_annotation(pid, filename):
             return jsonify(annotations=[{"class_id": cid, "labels": cid_to_labels(cid, lg)}])
         return jsonify(annotations=[])
 
+    if task == "semantic_segmentation":
+        raw = ap.read_text().strip()
+        if not raw:
+            return jsonify(annotations=[])
+        try:
+            payload = json.loads(raw)
+            anns = payload.get("annotations", [])
+            for ann in anns:
+                ann.setdefault("labels", cid_to_labels(ann.get("class_id", 0), lg))
+            return jsonify(annotations=anns)
+        except json.JSONDecodeError:
+            # Backward compatibility for projects saved before semantic JSON format.
+            anns = []
+            for line in raw.splitlines():
+                parts = line.split()
+                if not parts:
+                    continue
+                cid = int(parts[0])
+                coords = list(map(float, parts[1:]))
+                points = [[coords[i], coords[i + 1]] for i in range(0, len(coords), 2)]
+                anns.append({"class_id": cid, "labels": cid_to_labels(cid, lg), "polygon": points})
+            return jsonify(annotations=anns)
+
     annotations_out = []
     for line in ap.read_text().strip().splitlines():
         parts = line.split()
@@ -277,6 +438,28 @@ def save_annotation(pid, filename):
             ap.write_text(str(cid) + "\n")
         else:
             ap.write_text("")
+        return jsonify(ok=True)
+
+    if task == "semantic_segmentation":
+        anns = data.get("annotations", [])
+        try:
+            class_masks, sidecar, kept_anns = build_semantic_artifacts(p, filename, anns)
+        except ValueError as e:
+            msg = str(e)
+            code = "semantic_uncovered_pixels" if msg.startswith("Semantic masks must tile the image") else "semantic_invalid"
+            return jsonify(error=msg, error_code=code), 400
+
+        # Editor source-of-truth (normalized polygons + labels)
+        editor_payload = {
+            "format": "semantic_editor_v1",
+            "annotations": kept_anns,
+        }
+        ap.write_text(json.dumps(editor_payload, indent=2))
+
+        stem = Path(filename).stem
+        mask_dir = semantic_mask_dir(p, mkdir=True)
+        np.savez_compressed(mask_dir / f"{stem}.npz", masks=class_masks)
+        (mask_dir / f"{stem}.coco.json").write_text(json.dumps(sidecar, indent=2))
         return jsonify(ok=True)
 
     lines = []

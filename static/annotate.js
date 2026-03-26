@@ -28,6 +28,7 @@
   const STICKY_KEY    = "labeler_sticky_" + PID;
   const VERTEX_GRAB_R = 8;   // px screen-space
   const KPT_HIT_R     = 10;  // px image-space (divided by zoom at use-site)
+  const SEMANTIC_FILL_ALPHA = "66";
 
   const BASE_PALETTE = [
     "#e6194b","#3cb44b","#4363d8","#f58231","#911eb4",
@@ -106,6 +107,61 @@
       }
     }
     return inside;
+  }
+
+  function segmentsIntersect(ax, ay, bx, by, cx, cy, dx, dy) {
+    const eps = 1e-9;
+    const orient = (px, py, qx, qy, rx, ry) =>
+      (qy - py) * (rx - qx) - (qx - px) * (ry - qy);
+
+    const o1 = orient(ax, ay, bx, by, cx, cy);
+    const o2 = orient(ax, ay, bx, by, dx, dy);
+    const o3 = orient(cx, cy, dx, dy, ax, ay);
+    const o4 = orient(cx, cy, dx, dy, bx, by);
+
+    if ((o1 > eps && o2 < -eps || o1 < -eps && o2 > eps) &&
+        (o3 > eps && o4 < -eps || o3 < -eps && o4 > eps)) return true;
+
+    return false;
+  }
+
+  function polygonsOverlap(polyA, polyB) {
+    if (!polyA.length || !polyB.length) return false;
+    for (let i = 0; i < polyA.length; i++) {
+      const ni = (i + 1) % polyA.length;
+      const [ax, ay] = polyA[i];
+      const [bx, by] = polyA[ni];
+      for (let j = 0; j < polyB.length; j++) {
+        const nj = (j + 1) % polyB.length;
+        const [cx, cy] = polyB[j];
+        const [dx, dy] = polyB[nj];
+        if (segmentsIntersect(ax, ay, bx, by, cx, cy, dx, dy)) return true;
+      }
+    }
+    return pointInPolygon(polyA[0][0], polyA[0][1], polyB) ||
+           pointInPolygon(polyB[0][0], polyB[0][1], polyA);
+  }
+
+  function semanticPolygonOverlap(candidatePoly, ignoreIdx = -1) {
+    if (task !== "semantic_segmentation" || !candidatePoly || candidatePoly.length < 3) return false;
+    for (let i = 0; i < state.annotations.length; i++) {
+      if (i === ignoreIdx) continue;
+      const ann = state.annotations[i];
+      if (!ann.polygon) continue;
+      const poly = ann.polygon.map(([nx, ny]) => normToImage(nx, ny));
+      if (polygonsOverlap(candidatePoly, poly)) return true;
+    }
+    return false;
+  }
+
+  function selectedSemanticOverlap() {
+    if (task !== "semantic_segmentation") return false;
+    const idx = state.selectedIdx;
+    if (idx < 0 || idx >= state.annotations.length) return false;
+    const ann = state.annotations[idx];
+    if (!ann || !ann.polygon) return false;
+    const candidate = ann.polygon.map(([nx, ny]) => normToImage(nx, ny));
+    return semanticPolygonOverlap(candidate, idx);
   }
 
   /** Screen-space distance check for a handle (vertex / keypoint). */
@@ -422,8 +478,9 @@
   // ── Drawing finishers ──────────────────────────────────
 
   function finishPolygon() {
+    const imagePts = state.drawing.points;
     pushUndo();
-    const pts = state.drawing.points.map(([x, y]) => imageToNorm(x, y));
+    const pts = imagePts.map(([x, y]) => imageToNorm(x, y));
     state.annotations.push({ labels: currentLabels(), polygon: pts });
     selectAnnotation(state.annotations.length - 1);
     state.drawing = null;
@@ -900,6 +957,12 @@
                      10, canvas.height - 10);
       }
     }
+    if (task === "semantic_segmentation") {
+      ctx.fillStyle = "#4a6cf7";
+      ctx.font = "12px sans-serif";
+      ctx.fillText("Semantic mode: overlap is auto-trimmed on save; full image coverage is still required.",
+                   10, 18);
+    }
   }
 
   function drawAnnotation(ann, selected) {
@@ -927,7 +990,8 @@
       pts.forEach(([x, y], j) => j === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y));
       ctx.closePath();
       ctx.strokeStyle = color; ctx.lineWidth = lw; ctx.stroke();
-      ctx.fillStyle = color + "33"; ctx.fill();
+      ctx.fillStyle = task === "semantic_segmentation" ? (color + SEMANTIC_FILL_ALPHA) : (color + "33");
+      ctx.fill();
       pts.forEach(([x, y]) => {
         ctx.beginPath();
         ctx.arc(x, y, (selected ? 4 : 2.5) / z, 0, Math.PI * 2);
@@ -1162,29 +1226,31 @@
 
   async function save() {
     const btn = document.getElementById("btnSave");
-    try {
-      const body = { annotations: state.annotations };
+    const body = { annotations: state.annotations };
 
-      const resp = await fetch(`/api/project/${PID}/annotation/${encodeURIComponent(CURRENT)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
+    const resp = await fetch(`/api/project/${PID}/annotation/${encodeURIComponent(CURRENT)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
 
-      if (!resp.ok) {
-        throw new Error(`Save failed (${resp.status})`);
-      }
-
-      state.dirty = false;
-      const dot = document.getElementById("dot-" + CURRENT_IDX);
-      if (dot) dot.classList.add("labeled");
-      btn.textContent = "✓ Saved";
-    } catch (err) {
-      console.error("Save failed:", err);
+    if (!resp.ok) {
+      let msg = `Save failed (${resp.status})`;
+      try {
+        const data = await resp.json();
+        if (data && data.error) msg = data.error;
+      } catch (_) { /* ignore json parse error */ }
+      console.error("Save failed:", msg);
       btn.textContent = "❌ Save failed";
       setTimeout(() => { btn.textContent = "💾 Save"; }, 1800);
+      alert(msg);
       return;
     }
+
+    state.dirty = false;
+    const dot = document.getElementById("dot-" + CURRENT_IDX);
+    if (dot) dot.classList.add("labeled");
+    btn.textContent = "✓ Saved";
 
     setTimeout(() => { btn.textContent = "💾 Save"; }, 1200);
   }
@@ -1214,9 +1280,10 @@
     const bar = document.getElementById("toolButtons");
     const toolDefs = {
       classification:        [["select","🏷️ Classify"]],
-      detection:             [["select","👆 Select"],["bbox","⬜ BBox"]],
-      instance_segmentation: [["select","👆 Select"],["polygon","🔷 Polygon"],["magic_lasso","✨ Magic Lasso"]],
-      skeleton:              [["select","👆 Select"],["keypoint","🦴 Pose"]],
+      detection:             [["select","👆 Select"],["bbox","📦 Box"]],
+      instance_segmentation: [["select","👆 Select"],["polygon","💎 Polygon"],["magic_lasso","✨ Magic Lasso"]],
+      semantic_segmentation: [["select","👆 Select"],["polygon","✂️ Mask"],["magic_lasso","✨ Magic Lasso"]],
+      skeleton:              [["select","👆 Select"],["keypoint","🏃🏻 Skeleton"]],
     };
     const defs = toolDefs[task] || [];
     defs.forEach(([t, label]) => {
