@@ -5,29 +5,10 @@
   <header class="top-bar"><h1>🏷️ Image Labeler</h1></header>
 
   <div class="index-content">
-    <!-- project list -->
-    <section class="project-list">
-      <h2>Projects</h2>
-      {% for pid, p in projects.items() %}
-      <div class="project-card">
-        <div class="project-info">
-          <a href="/project/{{ pid }}"><strong>{{ p.name }}</strong></a>
-          <span class="badge">{{ task_display.get(p.task, p.task) }}</span>
-          <span class="progress">{{ p._labeled }}/{{ p._total }} labeled</span>
-        </div>
-        <button class="btn-sm btn-danger" onclick="deleteProject('{{ pid }}')">Delete</button>
-      </div>
-      {% endfor %}
-      {% if not projects %}
-      <p class="muted">No projects yet. Create one below.</p>
-      {% endif %}
-    </section>
-
     <!-- create form -->
-    <section class="create-section">
-      <h2>Create Project</h2>
-      <form id="createForm">
-        <label>Name <input name="name" required></label>
+    <section>
+      <form id="createForm" class="create-section">
+        <label>Project name <input name="name" required></label>
 
         <label for="imageDirInput">Image directory</label>
         <div class="folder-input-wrap">
@@ -72,6 +53,25 @@
         <button type="submit" class="btn-primary">Create</button>
         <div id="createError" class="error"></div>
       </form>
+    </section>
+
+    <!-- project list -->
+    <section class="project-list">
+      {% for pid, p in projects.items() %}
+      <div class="project-card">
+        <a href="/project/{{ pid }}" style="color: unset;">
+          <p><strong>{{ p.name }}</strong></p>
+          <p class="project-info">
+            <span class="badge">{{ task_display.get(p.task, p.task) }}</span>
+            <span class="badge">🚩 {{ p._labeled }}/{{ p._total }}</span>
+          </p>
+        </a>
+        <button class="btn-sm btn-danger" onclick="deleteProject('{{ pid }}')">Delete</button>
+      </div>
+      {% endfor %}
+      {% if not projects %}
+        <p style="text-align: center">No projects</p>
+      {% endif %}
     </section>
   </div>
 </div>

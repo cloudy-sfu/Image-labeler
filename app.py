@@ -34,10 +34,10 @@ IGNORE_FILES = {".DS_Store", "desktop.ini", "Thumbs.db", ".gitkeep"}
 
 # Front-end display names for tasks
 TASK_DISPLAY = {
-    "classification": "Image Classification",
-    "detection": "Object Detection (Bounding Box)",
-    "instance_segmentation": "Instance Segmentation (Polygon)",
-    "skeleton": "Keypoint / Pose Estimation",
+    "classification": "Classification",
+    "detection": "Object detection",
+    "instance_segmentation": "Instance segmentation (polygon)",
+    "skeleton": "Skeleton (pose) estimation",
 }
 TASK_KEYS = list(TASK_DISPLAY.keys())
 
