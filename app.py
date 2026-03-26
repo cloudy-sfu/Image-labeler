@@ -1,27 +1,30 @@
 """
 Flask-based image annotation tool with YOLO-format output.
 Supports: classification, detection, instance segmentation,
-semantic segmentation, and skeleton/pose annotation.
+skeleton/pose annotation.
 Ref: https://docs.ultralytics.com/datasets/
 """
-import base64
-import io
+import hashlib
 import json
 import os
 import socket
 import sys
 import uuid
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from itertools import product as cart_product
 from pathlib import Path
 
-import numpy as np
 from PIL import Image
 from flask import (
     Flask, render_template, request, jsonify,
     send_file, redirect, url_for, abort
 )
 
+from sam_engine import sam_engine
+
+executor = ThreadPoolExecutor(max_workers=2)
+sam_embed_status = {}
 app = Flask(__name__)
 app.secret_key = "labeler-secret"
 
@@ -34,7 +37,6 @@ TASK_DISPLAY = {
     "classification": "Image Classification",
     "detection": "Object Detection (Bounding Box)",
     "instance_segmentation": "Instance Segmentation (Polygon)",
-    "semantic_segmentation": "Semantic Segmentation (Pixel Mask)",
     "skeleton": "Keypoint / Pose Estimation",
 }
 TASK_KEYS = list(TASK_DISPLAY.keys())
@@ -90,14 +92,10 @@ def cid_to_labels(cid: int, label_groups: list[dict]) -> dict:
 def annotation_path(project: dict, image_name: str, mkdir=False) -> Path:
     ann_dir = Path(project["annotation_dir"])
     stem = Path(image_name).stem
-    if project["task"] == "semantic_segmentation":
-        d = ann_dir / "masks"
-    else:
-        d = ann_dir / "labels"
+    d = ann_dir / "labels"
     if mkdir:
         d.mkdir(parents=True, exist_ok=True)
-    ext = ".png" if project["task"] == "semantic_segmentation" else ".txt"
-    return d / (stem + ext)
+    return d / (stem + ".txt")
 
 
 def write_data_yaml(project: dict):
@@ -120,28 +118,6 @@ def write_data_yaml(project: dict):
     (ann_dir / "data.yaml").write_text(json.dumps(content, indent=2))
 
 
-def rgba_mask_to_single_channel(png_bytes: bytes) -> bytes:
-    """Convert RGBA mask PNG (R = class_id+1 encoding) to single-channel
-    class-index PNG (0 = background). This is the YOLO / Ultralytics
-    semantic segmentation format.
-    Ref: https://docs.ultralytics.com/datasets/segment/
-    """
-    img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
-    arr = np.array(img)
-    # Class was encoded as R = (cid+1) & 0xFF, G = ((cid+1)>>8) & 0xFF
-    r = arr[:, :, 0].astype(np.uint16)
-    g = arr[:, :, 1].astype(np.uint16)
-    a = arr[:, :, 3]
-    class_index = (g << 8 | r).astype(np.int32) - 1
-    # Where alpha is 0 → background (0)
-    class_index[a == 0] = 0
-    class_index[class_index < 0] = 0
-    out_img = Image.fromarray(class_index.astype(np.uint8), mode="L")
-    buf = io.BytesIO()
-    out_img.save(buf, format="PNG")
-    return buf.getvalue()
-
-
 # ── routes ───────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -158,12 +134,15 @@ def index():
 @app.route("/create", methods=["POST"])
 def create_project():
     data = request.get_json()
+    task = data.get("task")
+    if task not in TASK_KEYS:
+        return jsonify(error=f"Unsupported task: {task}"), 400
     pid = uuid.uuid4().hex[:12]
     project = {
         "name": data["name"],
         "image_dir": data["image_dir"],
         "annotation_dir": data["annotation_dir"],
-        "task": data["task"],
+        "task": task,
         "label_groups": data.get("label_groups", []),
         "keypoint_names": data.get("keypoint_names", []),
         "skeleton_edges": data.get("skeleton_edges", []),
@@ -244,25 +223,6 @@ def get_annotation(pid, filename):
     task = p["task"]
     lg = p["label_groups"]
 
-    if task == "semantic_segmentation":
-        # Convert single-channel back to RGBA for canvas display
-        sc_img = Image.open(ap).convert("L")
-        arr = np.array(sc_img).astype(np.uint16)
-        rgba = np.zeros((*arr.shape, 4), dtype=np.uint8)
-        mask_region = arr > 0
-        encoded = arr.astype(np.uint16) + 1  # re-encode: cid+1
-        # Only set pixels where class > 0
-        rgba[mask_region, 0] = (encoded[mask_region] & 0xFF).astype(np.uint8)
-        rgba[mask_region, 1] = ((encoded[mask_region] >> 8) & 0xFF).astype(np.uint8)
-        rgba[mask_region, 2] = 0
-        rgba[mask_region, 3] = 255
-        # Background remains fully transparent
-        out = Image.fromarray(rgba, mode="RGBA")
-        buf = io.BytesIO()
-        out.save(buf, format="PNG")
-        data64 = base64.b64encode(buf.getvalue()).decode()
-        return jsonify(annotations=[], mask=data64)
-
     if task == "classification":
         text = ap.read_text().strip()
         if text:
@@ -309,13 +269,6 @@ def save_annotation(pid, filename):
     lg = p["label_groups"]
     ap = annotation_path(p, filename, mkdir=True)
 
-    if task == "semantic_segmentation":
-        mask_b64 = data.get("mask")
-        if mask_b64:
-            raw_png = base64.b64decode(mask_b64)
-            sc_png = rgba_mask_to_single_channel(raw_png)
-            ap.write_bytes(sc_png)
-        return jsonify(ok=True)
 
     if task == "classification":
         anns = data.get("annotations", [])
@@ -404,6 +357,38 @@ def browse_folders():
     return jsonify(path=root, dirs=dirs, parent=parent)
 
 
+@app.route("/api/create_folder", methods=["POST"])
+def create_folder():
+    """Create a new subfolder in the selected parent directory."""
+    data = request.get_json() or {}
+    parent_path = str(data.get("parent_path", "")).strip()
+    folder_name = str(data.get("folder_name", "")).strip()
+
+    if not parent_path:
+        parent_path = str(Path.home())
+    parent_path = os.path.abspath(parent_path)
+
+    if not os.path.isdir(parent_path):
+        return jsonify(error="Parent directory does not exist"), 400
+
+    # Disallow path traversal or nested paths from the name field.
+    if (not folder_name or folder_name in {".", ".."}
+            or os.path.sep in folder_name
+            or (os.path.altsep and os.path.altsep in folder_name)):
+        return jsonify(error="Invalid folder name"), 400
+
+    new_path = os.path.abspath(os.path.join(parent_path, folder_name))
+    if os.path.commonpath([parent_path, new_path]) != parent_path:
+        return jsonify(error="Invalid folder path"), 400
+
+    try:
+        Path(new_path).mkdir(parents=False, exist_ok=True)
+    except OSError as e:
+        return jsonify(error=f"Cannot create folder: {e}"), 400
+
+    return jsonify(ok=True, path=new_path)
+
+
 @app.route("/api/project/<pid>/settings", methods=["GET"])
 def get_project_settings(pid):
     projects = load_projects()
@@ -473,6 +458,100 @@ def find_available_port(start_port: int, tries: int = 100):
             pass
     raise Exception(f"Tried {tries} times, no available port from {start_port} to "
                     f"{start_port + tries}.")
+
+
+# Ref: batch labeled-status endpoint to avoid N requests on page load
+@app.route("/api/project/<pid>/labeled_status")
+def labeled_status(pid):
+    projects = load_projects()
+    if pid not in projects:
+        abort(404)
+    p = projects[pid]
+    imgs = image_files(p["image_dir"])
+    result = {}
+    for f in imgs:
+        result[f] = annotation_path(p, f).exists()
+    return jsonify(result)
+
+
+@app.route("/api/sam/status")
+def sam_status():
+    """Report whether SAM is available."""
+    return jsonify(
+        available=sam_engine.available,
+        device=sam_engine.device if sam_engine.available else None,
+        model_type=sam_engine.model_type,
+    )
+
+
+def _compute_embedding_bg(pid, filename, img_path, cache_key):
+    """Background worker for embedding computation."""
+    try:
+        import cv2
+        image = cv2.imread(img_path)
+        if image is None:
+            sam_embed_status[cache_key] = "error"
+            return
+        sam_engine.compute_embedding(image, cache_key)
+        sam_embed_status[cache_key] = "ready"
+    except Exception as e:
+        app.logger.error("SAM embedding error: %s", e)
+        sam_embed_status[cache_key] = "error"
+
+
+@app.route("/api/project/<pid>/sam/embed/<path:filename>", methods=["POST"])
+def sam_embed(pid, filename):
+    """Start async embedding computation for an image."""
+    projects = load_projects()
+    if pid not in projects:
+        abort(404)
+    p = projects[pid]
+    img_path = os.path.join(p["image_dir"], filename)
+    if not os.path.isfile(img_path):
+        abort(404)
+    # Cache key = hash of project id + filename + file mtime
+    mtime = str(os.path.getmtime(img_path))
+    cache_key = hashlib.md5(f"{pid}:{filename}:{mtime}".encode()).hexdigest()
+    status = sam_embed_status.get(cache_key)
+    if status == "ready" or cache_key in sam_engine._embed_cache:
+        sam_embed_status[cache_key] = "ready"
+        return jsonify(status="ready", cache_key=cache_key)
+    if status == "pending":
+        return jsonify(status="pending", cache_key=cache_key)
+    sam_embed_status[cache_key] = "pending"
+    executor.submit(_compute_embedding_bg, pid, filename, img_path, cache_key)
+    return jsonify(status="pending", cache_key=cache_key)
+
+
+@app.route("/api/project/<pid>/sam/embed_status/<cache_key>")
+def sam_embed_status_check(pid, cache_key):
+    """Poll embedding computation status."""
+    status = sam_embed_status.get(cache_key, "unknown")
+    if cache_key in sam_engine._embed_cache:
+        status = "ready"
+    return jsonify(status=status, cache_key=cache_key)
+
+
+@app.route("/api/project/<pid>/sam/predict", methods=["POST"])
+def sam_predict(pid):
+    """Run SAM prediction given prompt points on a cached embedding."""
+    data = request.get_json()
+    cache_key = data.get("cache_key")
+    points = data.get("points", [])          # [[x,y], ...]  pixel coords
+    point_labels = data.get("point_labels", [])  # [1, 0, ...]
+    if not cache_key or not points:
+        return jsonify(error="cache_key and points required"), 400
+    try:
+        polygons, score = sam_engine.predict(
+            cache_key, points, point_labels,
+            simplify_tolerance=float(data.get("simplify", 1.5)),
+        )
+        return jsonify(polygons=polygons, score=score)
+    except KeyError:
+        return jsonify(error="Embedding not found. Re-embed the image."), 404
+    except Exception as e:
+        app.logger.error("SAM predict error: %s", e)
+        return jsonify(error=str(e)), 500
 
 
 if __name__ == '__main__':

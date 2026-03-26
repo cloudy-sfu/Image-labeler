@@ -38,7 +38,7 @@
         <label for="annDirInput">Annotation directory</label>
         <div class="folder-input-wrap">
           <input name="annotation_dir" id="annDirInput" required placeholder="/path/to/annotations">
-          <button type="button" class="btn-sm" onclick="openFolderPicker('annDirInput')">Browse…</button>
+          <button type="button" class="btn-sm" onclick="openAnnotationFolderPicker()">Browse…</button>
         </div>
 
         <label>Task
@@ -87,6 +87,11 @@
       <button class="btn-sm" id="folderUpBtn" onclick="folderUp()">⬆ Parent</button>
       <input id="folderPathDisplay" readonly>
     </div>
+    <div class="folder-create-bar">
+      <input id="folderCreateName" placeholder="New folder name">
+      <button class="btn-sm" onclick="createFolderFromPicker()">+ New folder</button>
+    </div>
+    <div id="folderPickerError" class="error" style="padding:0 18px 8px; display:none;"></div>
     <div class="folder-list" id="folderList"></div>
     <div class="modal-footer">
       <button class="btn-sm" onclick="closeFolderPicker()">Cancel</button>
@@ -231,13 +236,56 @@ function confirmLabelEditor() {
 // ── Folder picker ──
 let folderPickerTarget = null;
 let folderCurrentPath = '';
+let folderSelectedName = '';
 
-function openFolderPicker(inputId) {
+function joinFolderPath(base, child) {
+  if (!base) return child;
+  if (!child) return base;
+  if (base.endsWith('/') || base.endsWith('\\')) return base + child;
+  const sep = base.includes('\\') && !base.includes('/') ? '\\' : '/';
+  return base + sep + child;
+}
+
+function getParentFolderPath(path) {
+  const raw = (path || '').trim();
+  if (!raw) return '';
+  if (raw === '/' || raw === '\\') return raw;
+  if (/^[A-Za-z]:[\\/]?$/.test(raw)) {
+    return raw[0].toUpperCase() + ':\\';
+  }
+
+  const normalized = raw.replace(/[\\/]+$/, '');
+  const cut = Math.max(normalized.lastIndexOf('/'), normalized.lastIndexOf('\\'));
+  if (cut < 0) return '';
+  if (cut === 0) return normalized[0] === '/' ? '/' : '';
+
+  const parent = normalized.slice(0, cut);
+  return /^[A-Za-z]:$/.test(parent) ? parent + '\\' : parent;
+}
+
+function clearFolderPickerError() {
+  const err = document.getElementById('folderPickerError');
+  err.style.display = 'none';
+  err.textContent = '';
+}
+
+function showFolderPickerError(msg) {
+  const err = document.getElementById('folderPickerError');
+  err.textContent = msg;
+  err.style.display = '';
+}
+
+function openFolderPicker(inputId, startPath = '') {
   folderPickerTarget = inputId;
-  // Start from current value in the input, or fall back to server-side home
+  folderSelectedName = '';
+  clearFolderPickerError();
+  document.getElementById('folderCreateName').value = '';
+  // Start from explicit start path, then current input value, then home.
+  const preferredVal = (startPath || '').trim();
   const currentVal = document.getElementById(inputId).value.trim();
-  if (currentVal) {
-    loadFolder(currentVal);
+  const initialPath = preferredVal || currentVal;
+  if (initialPath) {
+    loadFolder(initialPath);
   } else {
     // Request home directory from server
     loadFolder('__HOME__');
@@ -245,11 +293,18 @@ function openFolderPicker(inputId) {
   document.getElementById('folderModal').style.display = '';
 }
 
+function openAnnotationFolderPicker() {
+  const imageDir = document.getElementById('imageDirInput').value;
+  const imageParent = getParentFolderPath(imageDir);
+  openFolderPicker('annDirInput', imageParent);
+}
+
 function closeFolderPicker() {
   document.getElementById('folderModal').style.display = 'none';
 }
 
 async function loadFolder(path) {
+  clearFolderPickerError();
   const res = await fetch('/api/browse_folders?path=' + encodeURIComponent(path));
   const data = await res.json();
   if (data.error) {
@@ -260,6 +315,7 @@ async function loadFolder(path) {
     return;
   }
   folderCurrentPath = data.path || '';
+  folderSelectedName = '';
   document.getElementById('folderPathDisplay').value = folderCurrentPath || '(root)';
   document.getElementById('folderUpBtn').disabled = !data.parent;
   const list = document.getElementById('folderList');
@@ -269,13 +325,12 @@ async function loadFolder(path) {
     div.className = 'folder-item';
     div.textContent = '📁 ' + d;
     div.addEventListener('dblclick', () => {
-      const sep = folderCurrentPath.endsWith('/') || folderCurrentPath.endsWith('\\') ? '' : '/';
-      const newPath = folderCurrentPath ? (folderCurrentPath + sep + d) : d;
-      loadFolder(newPath);
+      loadFolder(joinFolderPath(folderCurrentPath, d));
     });
     div.addEventListener('click', () => {
       list.querySelectorAll('.folder-item').forEach(el => el.classList.remove('selected'));
       div.classList.add('selected');
+      folderSelectedName = d;
     });
     list.appendChild(div);
   });
@@ -291,9 +346,33 @@ function folderUp() {
 function confirmFolder() {
   if (folderPickerTarget && folderCurrentPath) {
     const inp = document.getElementById(folderPickerTarget);
-    inp.value = folderCurrentPath;
+    inp.value = folderSelectedName
+      ? joinFolderPath(folderCurrentPath, folderSelectedName)
+      : folderCurrentPath;
   }
   closeFolderPicker();
+}
+
+async function createFolderFromPicker() {
+  const nameInput = document.getElementById('folderCreateName');
+  const folderName = nameInput.value.trim();
+  if (!folderName) {
+    showFolderPickerError('Please enter a folder name.');
+    return;
+  }
+  clearFolderPickerError();
+  const res = await fetch('/api/create_folder', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ parent_path: folderCurrentPath, folder_name: folderName })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    showFolderPickerError(data.error || 'Failed to create folder.');
+    return;
+  }
+  nameInput.value = '';
+  await loadFolder(data.path);
 }
 
 // ── Create project submit ──
