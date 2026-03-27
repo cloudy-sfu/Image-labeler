@@ -190,29 +190,16 @@ Example:
 
 ![image-20260326210126006](./assets/image-20260326210126006.png)
 
-The skeleton is an undirected graph in mathematics. When creating a project, skeleton configuration defines the topology. In this image, vertex names are:
+The skeleton is an undirected graph in mathematics. When creating a project, skeleton configuration defines the topology. Standard YOLO pose models require all classes to share the exact same vertex topology (number of vertices and dimensions).
 
-```
-head
-neck
-left_elbow
-left_hand
-right_elbow
-right_hand
-waist
-left_knee
-right_knee
-left_foot
-right_foot
-```
+Supported functions:
 
-Edges are:
+-   [Select]  Select a vertex to edit its name or delete it.
+-   [Add vertex]  Add a new vertex.
+-   [Connect]  Click vertex pairs to add an edge between them. After finishing an edge, if you intend to connect continuously, you should to click the ending vertex again to define it as the starting vertex of the next edge.
+-   [Disconnect]  Click vertex pairs to delete the edge between them.
 
-```
-0-1,1-2,2-3,1-4,4-5,1-6,6-7,6-8,7-9,8-10
-```
-
-The numbers are the index of vertex (starting from 0) in the vertex names list. Two digits and a dash defines the starting vertex, edge, and the ending vertex, separated by comma.
+![image-20260327225959086](./assets/image-20260327225959086.png)
 
 The undirected graph defines the skeleton (simplified) of a human that connects each part together.
 
@@ -221,8 +208,6 @@ Each vertex has 3 visibility status:
 -   Visible: The object is fully or mostly visible in the image.
 -   Occluded: The object is partially hidden by another object. Following COCO dataset, if a key point (vertex) is physically absent (not covered by other objects), still consider it as "occluded".
 -   Not Labeled: The object exists in the image but is intentionally excluded from annotation.
-
-In this program, a project can only has 1 skeleton topology graph, but can have multiple classes.
 
 Annotation format:
 

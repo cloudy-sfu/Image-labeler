@@ -1130,12 +1130,11 @@
     state.annotations.forEach((ann, i) => {
       const div = document.createElement("div");
       div.className = "ann-item" + (i === state.selectedIdx ? " selected" : "");
-      const typeIcon = ann.bbox && ann.keypoints ? "🦴" : ann.bbox ? "⬜" : ann.polygon ? "🔷" : "?";
-      const labelStr = Object.values(ann.labels).join(", ");
+      const labelStr = Object.values(ann.labels).join(" | ");
       const annColor = colorForLabels(ann.labels);
       div.innerHTML =
         `<span><span class="ann-color-dot" style="background:${annColor}"></span>` +
-        `${typeIcon} #${i + 1} ${labelStr}</span>` +
+        `#${i + 1} ${labelStr}</span>` +
         `<span class="ann-del" data-i="${i}">×</span>`;
       div.addEventListener("click", e => {
         if (e.target.classList.contains("ann-del")) {

@@ -85,12 +85,47 @@ legend { font-weight:600; }
 .label-editor-row .le-desc { flex:3; }
 .label-editor-row .le-del { flex-shrink:0; }
 
+/* Skeleton editor */
+.skeleton-editor-toolbar {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.skeleton-editor-panel {
+  display: grid;
+  grid-template-columns: 1fr 220px;
+  gap: 10px;
+  align-items: start;
+}
+.skeleton-canvas {
+  width: 100%;
+  height: 300px;
+  border: 1px solid #d7defd;
+  border-radius: 6px;
+  background: #f7f9ff;
+  touch-action: none;
+}
+.skeleton-vertex-panel {
+  border: 1px solid #e6e9f8;
+  border-radius: 6px;
+  background: #fafbff;
+  padding: 10px;
+}
+
+@media (max-width: 760px) {
+  .skeleton-editor-panel {
+    grid-template-columns: 1fr;
+  }
+}
+
 /* Annotate layout */
 .annotate-layout { display:grid; grid-template-columns:200px 1fr 260px;
                    grid-template-rows:44px 1fr; height:100vh; }
 .toolbar { grid-column:1/-1; display:flex; align-items:center; gap:10px;
            padding:0 12px; background:#fff; border-bottom:1px solid #ddd; z-index:10; }
-.toolbar-brand { font-size:16px; font-weight:700; }
+.toolbar-brand { font-size:16px; font-weight:700; color: unset; }
 .toolbar-title { font-size:13px; color:#555; flex:1; overflow:hidden; text-overflow:ellipsis;
                  white-space:nowrap; }
 .toolbar-tools { display:flex; gap:4px; }

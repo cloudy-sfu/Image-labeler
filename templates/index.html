@@ -13,13 +13,13 @@
         <label for="imageDirInput">Image directory</label>
         <div class="folder-input-wrap">
           <input name="image_dir" id="imageDirInput" required placeholder="/path/to/images">
-          <button type="button" class="btn-sm" onclick="openFolderPicker('imageDirInput')">Browse…</button>
+          <button type="button" class="btn-sm" onclick="openFolderPicker('imageDirInput')">📁 Browse</button>
         </div>
 
         <label for="annDirInput">Annotation directory</label>
         <div class="folder-input-wrap">
           <input name="annotation_dir" id="annDirInput" required placeholder="/path/to/annotations">
-          <button type="button" class="btn-sm" onclick="openAnnotationFolderPicker()">Browse…</button>
+          <button type="button" class="btn-sm" onclick="openAnnotationFolderPicker()">📁 Browse</button>
         </div>
 
         <label>Task
@@ -31,23 +31,35 @@
         </label>
 
         <fieldset id="labelGroupsFieldset">
-          <legend>Label Groups (dimensions)</legend>
+          <legend>Label groups (dimensions)</legend>
           <p class="muted" style="font-size:12px;margin-bottom:8px;">
             Each group defines an independent classification dimension.
             Every annotation must have exactly one label per group.
           </p>
           <div id="labelGroupsContainer"></div>
-          <button type="button" class="btn-sm" onclick="addLabelGroup()">+ Add group</button>
+          <button type="button" class="btn-sm" onclick="addLabelGroup()">📚 Add group</button>
         </fieldset>
 
         <fieldset id="skeletonFieldset" style="display:none">
-          <legend>Skeleton Configuration</legend>
-          <label>Vertex names (one per line)
-            <textarea name="keypoint_names" rows="4" placeholder="nose&#10;left_eye&#10;right_eye"></textarea>
-          </label>
-          <label>Edges (pairs, e.g. 0-1,1-2,0-2)
-            <input name="skeleton_edges" placeholder="0-1,1-2">
-          </label>
+          <legend>Skeleton graph</legend>
+          <p class="muted" style="font-size:12px;margin-bottom:8px;">
+            Add vertex, drag them on canvas, and use edge tools to connect or disconnect pairs.
+          </p>
+          <div class="skeleton-editor-toolbar">
+            <button type="button" class="btn-sm" id="skeToolSelect">👆 Select</button>
+            <button type="button" class="btn-sm" id="skeToolAddEdge">➕ Connect</button>
+            <button type="button" class="btn-sm" id="skeToolDeleteEdge">➖ Disconnect</button>
+            <span class="toolbar-sep"></span>
+            <button type="button" class="btn-sm" id="skeAddVertex">📍 Add vertex</button>
+          </div>
+          <div class="skeleton-editor-panel">
+            <canvas id="skeletonCanvas" class="skeleton-canvas" width="640" height="300"></canvas>
+            <div class="skeleton-vertex-panel">
+              <label for="selectedVertexName">Name</label>
+              <input id="selectedVertexName" disabled style="margin-bottom: 0.5rem;">
+              <button type="button" class="btn-sm btn-danger" id="deleteVertexBtn" disabled>Delete</button>
+            </div>
+          </div>
         </fieldset>
 
         <button type="submit" class="btn-primary">Create</button>
@@ -84,18 +96,18 @@
       <button class="btn-sm" onclick="closeFolderPicker()">✕</button>
     </div>
     <div class="folder-path-bar">
-      <button class="btn-sm" id="folderUpBtn" onclick="folderUp()">⬆ Parent</button>
+      <button class="btn-sm" id="folderUpBtn" onclick="folderUp()">⬆️ Parent</button>
       <input id="folderPathDisplay" readonly>
     </div>
     <div class="folder-create-bar">
       <input id="folderCreateName" placeholder="New folder name">
-      <button class="btn-sm" onclick="createFolderFromPicker()">+ New folder</button>
+      <button class="btn-sm" onclick="createFolderFromPicker()">🗂️ New folder</button>
     </div>
     <div id="folderPickerError" class="error" style="padding:0 18px 8px; display:none;"></div>
     <div class="folder-list" id="folderList"></div>
     <div class="modal-footer">
       <button class="btn-sm" onclick="closeFolderPicker()">Cancel</button>
-      <button class="btn-primary" onclick="confirmFolder()">Select this folder</button>
+      <button class="btn-primary" onclick="confirmFolder()">Select</button>
     </div>
   </div>
 </div>
@@ -112,7 +124,7 @@
         One label per row. Label name is required; description is optional.
       </p>
       <div id="labelEditorRows"></div>
-      <button type="button" class="btn-sm" onclick="addLabelRow()">+ Add label</button>
+      <button type="button" class="btn-sm" onclick="addLabelRow()">🏷️ Add label</button>
     </div>
     <div class="modal-footer">
       <button class="btn-sm" onclick="closeLabelEditor()">Cancel</button>
@@ -121,11 +133,26 @@
   </div>
 </div>
 
+<script src="{{ url_for('static', filename='skeleton_editor.js') }}"></script>
+
 <script>
+const skeletonEditor = window.createSkeletonEditor({
+  canvasId: 'skeletonCanvas',
+  addVertexBtnId: 'skeAddVertex',
+  selectToolBtnId: 'skeToolSelect',
+  addEdgeToolBtnId: 'skeToolAddEdge',
+  deleteEdgeToolBtnId: 'skeToolDeleteEdge',
+  vertexNameInputId: 'selectedVertexName',
+  deleteVertexBtnId: 'deleteVertexBtn'
+});
+
 // ── Task select toggle skeleton ──
 document.getElementById('taskSelect').addEventListener('change', e => {
-  document.getElementById('skeletonFieldset').style.display =
-    e.target.value === 'skeleton' ? '' : 'none';
+  const isSkeleton = e.target.value === 'skeleton';
+  document.getElementById('skeletonFieldset').style.display = isSkeleton ? '' : 'none';
+  if (isSkeleton && skeletonEditor) {
+    requestAnimationFrame(() => skeletonEditor.resize());
+  }
 });
 
 // ── Label Groups ──
@@ -388,11 +415,8 @@ document.getElementById('createForm').addEventListener('submit', async e => {
         .map(g => ({ name: g.name.trim(), labels: g.labels })),
   };
   if (body.task === 'skeleton') {
-    body.keypoint_names = fd.get('keypoint_names').split('\n').map(s => s.trim()).filter(Boolean);
-    body.skeleton_edges = fd.get('skeleton_edges').split(',').map(s => {
-      const [a, b] = s.trim().split('-').map(Number);
-      return [a, b];
-    }).filter(e => e.length === 2 && !isNaN(e[0]));
+    body.keypoint_names = skeletonEditor ? skeletonEditor.getKeypointNames() : [];
+    body.skeleton_edges = skeletonEditor ? skeletonEditor.getSkeletonEdges() : [];
   }
   const res = await fetch('/create', {
     method: 'POST',
